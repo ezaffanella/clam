@@ -752,23 +752,27 @@ public:
   }
 
   AliasResult alias(const MemoryLocation &l1, const MemoryLocation &l2,
-		    AAQueryInfo &AAQI) {
+		    AAQueryInfo &AAQI) const {
     return m_query_cache.alias(l1, l2, AAQI);
   }
   
-  ConstantRange range(const Instruction &I) {
+  ConstantRange range(const Instruction &I) const {
     return m_query_cache.range(I, getPre(I.getParent(), false));
   }
+
+  ConstantRange range(const Instruction &Inst, unsigned i) const {
+    return m_query_cache.range(Inst, i, getPre(Inst.getParent(), false));
+  }
   
-  ConstantRange range(const BasicBlock &B, const Value &V) {
+  ConstantRange range(const BasicBlock &B, const Value &V) const {
     return m_query_cache.range(B, V, getPre(&B, false));
   }
 
-  Optional<ClamQueryAPI::TagVector> tags(const Instruction &I) {
+  Optional<ClamQueryAPI::TagVector> tags(const Instruction &I) const {
     return m_query_cache.tags(I, getPre(I.getParent(), false));
   }
   
-  Optional<ClamQueryAPI::TagVector> tags(const BasicBlock &B, const Value &V) {
+  Optional<ClamQueryAPI::TagVector> tags(const BasicBlock &B, const Value &V) const {
     return m_query_cache.tags(B, V, getPre(&B, false));
   }
   
@@ -858,23 +862,27 @@ public:
   }
   
   AliasResult alias(const MemoryLocation &l1, const MemoryLocation &l2,
-		    AAQueryInfo &AAQI) {
+		    AAQueryInfo &AAQI) const {
     return m_query_cache.alias(l1, l2, AAQI);    
   }
   
-  ConstantRange range(const Instruction &I) {
+  ConstantRange range(const Instruction &I) const {
     return m_query_cache.range(I, getPre(I.getParent(), false));    
   }
+
+  ConstantRange range(const Instruction &Inst, unsigned i) const {
+    return m_query_cache.range(Inst, i, getPre(Inst.getParent(), false));    
+  }
   
-  ConstantRange range(const BasicBlock &B, const Value &V) {
+  ConstantRange range(const BasicBlock &B, const Value &V) const {
     return m_query_cache.range(B, V, getPre(&B, false));    
   }
 
-  Optional<ClamQueryAPI::TagVector> tags(const Instruction &I) {
+  Optional<ClamQueryAPI::TagVector> tags(const Instruction &I) const {
     return m_query_cache.tags(I, getPre(I.getParent(), false));
   }
   
-  Optional<ClamQueryAPI::TagVector> tags(const BasicBlock &B, const Value &V) {
+  Optional<ClamQueryAPI::TagVector> tags(const BasicBlock &B, const Value &V) const {
     return m_query_cache.tags(B, V, getPre(&B, false));
   }
   
@@ -1216,23 +1224,27 @@ bool IntraGlobalClam::hasFeasibleEdge(const BasicBlock *b1,
 }
 
 AliasResult IntraGlobalClam::alias(const MemoryLocation &l1, const MemoryLocation &l2,
-				   AAQueryInfo &AAQI) {
+				   AAQueryInfo &AAQI) const {
   return m_impl->alias(l1, l2, AAQI);
 }
   
-ConstantRange IntraGlobalClam::range(const Instruction &I) {
+ConstantRange IntraGlobalClam::range(const Instruction &I) const {
   return m_impl->range(I);
 }
+
+ConstantRange IntraGlobalClam::range(const Instruction &Inst, unsigned i) const {
+  return m_impl->range(Inst, i);
+}
   
-ConstantRange IntraGlobalClam::range(const BasicBlock &B, const Value &V) {
+ConstantRange IntraGlobalClam::range(const BasicBlock &B, const Value &V) const {
   return m_impl->range(B, V);
 }
 
-Optional<ClamQueryAPI::TagVector> IntraGlobalClam::tags(const Instruction &I) {
+Optional<ClamQueryAPI::TagVector> IntraGlobalClam::tags(const Instruction &I) const {
   return m_impl->tags(I);
 }
 
-Optional<ClamQueryAPI::TagVector> IntraGlobalClam::tags(const BasicBlock &B, const Value &V) {
+Optional<ClamQueryAPI::TagVector> IntraGlobalClam::tags(const BasicBlock &B, const Value &V) const {
   return m_impl->tags(B,V);
 }
 
@@ -1289,23 +1301,27 @@ bool InterGlobalClam::hasFeasibleEdge(const BasicBlock *b1,
 }
 
 AliasResult InterGlobalClam::alias(const MemoryLocation &l1, const MemoryLocation &l2,
-				   AAQueryInfo &AAQI) {
+				   AAQueryInfo &AAQI) const {
   return m_impl->alias(l1, l2, AAQI);
 }
   
-ConstantRange InterGlobalClam::range(const Instruction &I) {
+ConstantRange InterGlobalClam::range(const Instruction &I) const {
   return m_impl->range(I);
 }
+
+ConstantRange InterGlobalClam::range(const Instruction &Inst, unsigned i) const {
+  return m_impl->range(Inst, i);
+}
   
-ConstantRange InterGlobalClam::range(const BasicBlock &B, const Value &V) {
+ConstantRange InterGlobalClam::range(const BasicBlock &B, const Value &V) const {
   return m_impl->range(B, V);
 }
 
-Optional<ClamQueryAPI::TagVector> InterGlobalClam::tags(const Instruction &I) {
+Optional<ClamQueryAPI::TagVector> InterGlobalClam::tags(const Instruction &I) const {
   return m_impl->tags(I);
 }
 
-Optional<ClamQueryAPI::TagVector> InterGlobalClam::tags(const BasicBlock &B, const Value &V) {
+Optional<ClamQueryAPI::TagVector> InterGlobalClam::tags(const BasicBlock &B, const Value &V) const {
   return m_impl->tags(B,V);
 }
 
@@ -1367,14 +1383,14 @@ bool ClamPass::runOnModule(Module &M) {
     seadsa::DsaLibFuncInfo &dsaLibFuncInfo =
         getAnalysis<seadsa::DsaLibFuncInfo>();
 
-    mem.reset(new SeaDsaHeapAbstraction(
-        M, cg, tli, allocWrapInfo, dsaLibFuncInfo,
-        (CrabHeapAnalysis == heap_analysis_t::CS_SEA_DSA),
-        CrabDsaDisambiguateUnknown, CrabDsaDisambiguatePtrCast,
-        CrabDsaDisambiguateExternal));
-    CRAB_VERBOSE_IF(1, crab::get_msg_stream()
-                           << "Finished sea-dsa analysis\n";);
-
+    SeaDsaHeapAbstractionParams params;
+    params.precision_level = CrabTrackLev;
+    params.is_context_sensitive = CrabHeapAnalysis == heap_analysis_t::CS_SEA_DSA;
+    params.disambiguate_unknown = CrabDsaDisambiguateUnknown;
+    params.disambiguate_ptr_cast = CrabDsaDisambiguatePtrCast;
+    params.disambiguate_external = CrabDsaDisambiguateExternal;
+    mem.reset(new SeaDsaHeapAbstraction(M, cg, tli, allocWrapInfo, dsaLibFuncInfo, params));
+    CRAB_VERBOSE_IF(1, crab::get_msg_stream() << "Finished sea-dsa analysis\n";);
     if (CrabDsaDot) {
       seadsa::DsaPrinter
 	printer(*(static_cast<SeaDsaHeapAbstraction*>(&*mem)->getSeaDsa()), &ccg);

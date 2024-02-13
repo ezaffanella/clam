@@ -7,6 +7,8 @@
  * the callgraph is complete.
  */
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ImmutableSet.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/IR/Function.h"
@@ -24,24 +26,136 @@
 
 #include "SeaDsaHeapAbstractionUtils.hh"
 #include "SeaDsaToRegion.hh"
+#include "clam/HeapAbstraction.hh"
 #include "clam/SeaDsaHeapAbstraction.hh"
 #include "clam/Support/Debug.hh"
 #include "crab/support/debug.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <set>
+#include <unordered_map>
 
 namespace clam {
 
 using namespace seadsa;
 using namespace llvm;
 
-Region SeaDsaHeapAbstraction::mkRegion(const Cell &c, RegionInfo ri) {
+class SeaDsaHeapAbstractionImpl {
+  // XXX: We should use seadsa::Graph::SetFactory.
+  // We copy here the definition of seadsa::Graph::SetFactory so
+  // that we don't need to include Graph.hh
+  using Set = llvm::ImmutableSet<llvm::Type *>;
+  using SetFactory = typename Set::Factory;
+  using callsite_map_t =
+      llvm::DenseMap<const llvm::CallInst *, std::vector<std::pair<Region, bool>>>;
+
+  Region mkRegion(const seadsa::Cell &c, RegionInfo ri);
+
+  HeapAbstraction::RegionId getId(const seadsa::Cell &c);
+
+  void initialize(const llvm::Module &M);
+
+  // compute and cache the set of read, mod and new nodes of a whole
+  // function such that mod nodes are a subset of the read nodes and
+  // the new nodes are disjoint from mod nodes.
+  void computeReadModNewNodes(const llvm::Function &f);
+
+  // Compute and cache the set of read, mod and new nodes of a
+  // callsite such that mod nodes are a subset of the read nodes and
+  // the new nodes are disjoint from mod nodes.
+  void computeReadModNewNodesFromCallSite(const llvm::CallInst &I,
+                                          callsite_map_t &accessed,
+                                          callsite_map_t &mods,
+                                          callsite_map_t &news);
+
+  void computeEquivClasses(const llvm::Function &f);
+
+  const llvm::Value *getSingleton(HeapAbstraction::RegionId region) const;
+
+public:
+  // This constructor creates and owns a sea-dsa GlobalAnalysis instance and
+  // run it on M.
+  SeaDsaHeapAbstractionImpl(const llvm::Module &M, llvm::CallGraph &cg,
+                            const llvm::TargetLibraryInfoWrapperPass &tli,
+                            const seadsa::AllocWrapInfo &alloc_wrap_info,
+                            const seadsa::DsaLibFuncInfo &spec_graph_info,
+			    SeaDsaHeapAbstractionParams params);
+
+  // This constructor takes an existing sea-dsa Global Analysis instance.
+  // It doesn't own it.
+  SeaDsaHeapAbstractionImpl(const llvm::Module &M, seadsa::GlobalAnalysis &dsa,
+			    SeaDsaHeapAbstractionParams params);
+
+  ~SeaDsaHeapAbstractionImpl();
+
+  seadsa::GlobalAnalysis *getSeaDsa() { return m_dsa; }
+
+  const seadsa::GlobalAnalysis *getSeaDsa() const { return m_dsa; }
+
+  // Use F and V to get sea-dsa cell associated to it.
+  Region getRegion(const llvm::Function &F, const llvm::Value &V);
+
+  // Use F and V to get the sea-dsa node associated to V and extracts
+  // the region associated to nodes's field offset if any.
+  Region getRegion(const llvm::Function &F, const llvm::Value &V,
+                   unsigned offset, const llvm::Type &AccessedType);
+
+  HeapAbstraction::RegionVec getOnlyReadRegions(const llvm::Function &F) const;
+
+  HeapAbstraction::RegionVec getModifiedRegions(const llvm::Function &F) const;
+
+  HeapAbstraction::RegionVec getNewRegions(const llvm::Function &F) const;
+
+  HeapAbstraction::RegionVec getOnlyReadRegions(const llvm::CallInst &I) const;
+
+  HeapAbstraction::RegionVec getModifiedRegions(const llvm::CallInst &I) const;
+
+  HeapAbstraction::RegionVec getNewRegions(const llvm::CallInst &I) const;
+
+  std::vector<HeapAbstraction::RegionVec>
+  getEquivClassRegions(const llvm::Function &F) const;
+
+private:
+  seadsa::GlobalAnalysis *m_dsa;
+  std::unique_ptr<SetFactory> m_fac;
+  const llvm::DataLayout &m_dl;
+  /// map from Node to id
+  llvm::DenseMap<const seadsa::Node *, HeapAbstraction::RegionId> m_node_ids;
+  /// reverse map
+  std::unordered_map<HeapAbstraction::RegionId, const seadsa::Node *>
+      m_rev_node_ids;
+  HeapAbstraction::RegionId m_max_id;
+  SeaDsaHeapAbstractionParams m_params;
+
+  // read or modified regions reachable from inputs or globals
+  llvm::DenseMap<const llvm::Function *, HeapAbstraction::RegionVec>
+      m_func_accessed;
+  // modified regions reachable from inputs or globals
+  llvm::DenseMap<const llvm::Function *, HeapAbstraction::RegionVec>
+      m_func_mods;
+  // regions reachable only from return parameters
+  llvm::DenseMap<const llvm::Function *, HeapAbstraction::RegionVec>
+      m_func_news;
+  llvm::DenseMap<const llvm::CallInst *, HeapAbstraction::RegionVec>
+      m_callsite_accessed;
+  llvm::DenseMap<const llvm::CallInst *, HeapAbstraction::RegionVec>
+      m_callsite_mods;
+  llvm::DenseMap<const llvm::CallInst *, HeapAbstraction::RegionVec>
+      m_callsite_news;
+
+  // Group together all the regions originated from the same node
+  llvm::DenseMap<const llvm::Function *,
+                 std::vector<HeapAbstraction::RegionVec>>
+      m_func_equiv_class_regions;
+};
+
+Region SeaDsaHeapAbstractionImpl::mkRegion(const Cell &c, RegionInfo ri) {
   auto id = getId(c);
   return Region(id, ri, getSingleton(id));
 }
 
-SeaDsaHeapAbstraction::RegionId SeaDsaHeapAbstraction::getId(const Cell &c) {
+HeapAbstraction::RegionId SeaDsaHeapAbstractionImpl::getId(const Cell &c) {
   const Node *n = c.getNode();
   unsigned offset = c.getOffset();
 
@@ -50,7 +164,7 @@ SeaDsaHeapAbstraction::RegionId SeaDsaHeapAbstraction::getId(const Cell &c) {
     return it->second + offset;
   }
 
-  RegionId id = m_max_id;
+  HeapAbstraction::RegionId id = m_max_id;
   m_node_ids[n] = id;
 
   // XXX: we only have the reverse map for the offset 0.  That's
@@ -82,17 +196,18 @@ static std::vector<unsigned> extractFields(const Node *n,
     }
     if (fields.empty() && forceZeroOffset) {
       fields.push_back(0);
-    }    
+    }
   }
-  std::sort(fields.begin(), fields.end());  
+  std::sort(fields.begin(), fields.end());
   return fields;
 }
-   
+
 // compute and cache the set of read, mod and new reachable nodes from
 // globals and function's parameters and returns such that mod nodes
 // are a subset of the read nodes and the new nodes are disjoint from
 // mod nodes.
-void SeaDsaHeapAbstraction::computeReadModNewNodes(const llvm::Function &f) {
+void SeaDsaHeapAbstractionImpl::computeReadModNewNodes(
+    const llvm::Function &f) {
 
   if (!m_dsa || !(m_dsa->hasGraph(f))) {
     return;
@@ -108,8 +223,8 @@ void SeaDsaHeapAbstraction::computeReadModNewNodes(const llvm::Function &f) {
   seadsa_heap_abs_impl::NodeSet reach, retReach;
   seadsa_heap_abs_impl::argReachableNodes(f, G, reach, retReach);
 
-  RegionVec reads, mods, news;
-  std::vector<RegionVec> equivClasses;
+  HeapAbstraction::RegionVec reads, mods, news;
+  std::vector<HeapAbstraction::RegionVec> equivClasses;
   for (const Node *n : reach) {
     bool isRetReach = retReach.count(n) > 0;
 
@@ -123,8 +238,10 @@ void SeaDsaHeapAbstraction::computeReadModNewNodes(const llvm::Function &f) {
     for (auto field : fields) {
       Cell c(const_cast<Node *>(n), field);
       RegionInfo r_info =
-          SeaDsaToRegion(c, m_dl, m_disambiguate_unknown,
-                         m_disambiguate_ptr_cast, m_disambiguate_external);
+          SeaDsaToRegion(c, m_dl,
+			 m_params.disambiguate_unknown,
+                         m_params.disambiguate_ptr_cast,
+			 m_params.disambiguate_external);
       Region rgn = mkRegion(c, r_info);
       if (!isRetReach) {
         // reachable from function arguments or globals
@@ -140,12 +257,11 @@ void SeaDsaHeapAbstraction::computeReadModNewNodes(const llvm::Function &f) {
         //}
       }
     } // end for each field
-  } // end for each node
+  }   // end for each node
   CRAB_LOG(
       "heap-abs-regions", llvm::errs()
                               << "### HEAP_ABS: " << f.getName() << " ###\n";
-      llvm::errs()
-      << "Read regions reachable from arguments and globals {";
+      llvm::errs() << "Read regions reachable from arguments and globals {";
       for (auto &r
            : reads) { llvm::errs() << r << ";"; } llvm::errs()
       << "}\n";
@@ -157,75 +273,90 @@ void SeaDsaHeapAbstraction::computeReadModNewNodes(const llvm::Function &f) {
       for (auto &r
            : news) { llvm::errs() << r << ";"; } llvm::errs()
       << "}\n";);
-  
+
   m_func_accessed[&f] = std::move(reads);
   m_func_mods[&f] = std::move(mods);
-  m_func_news[&f] = std::move(news);  
+  m_func_news[&f] = std::move(news);
 }
 
-/* 
+/*
  * Remember regions originated from the same seadsa node.
- * 
+ *
  * This method iterates *again* over inputs and outputs. Part of the
  * work can be done in computeReadModNewNode but I prefer to redo the
  * work and keep it clean and simple.
  */
-void SeaDsaHeapAbstraction::computeEquivClasses(const llvm::Function &f) {
+void SeaDsaHeapAbstractionImpl::computeEquivClasses(const llvm::Function &f) {
   if (!m_dsa || !(m_dsa->hasGraph(f))) {
     return;
   }
-  
+
   Graph &G = m_dsa->getGraph(f);
   if (f.getName().startswith("shadow.mem")) {
     return;
   }
 
   // to store the equivalence classes
-  std::vector<RegionVec> equivClasses;
-  
+  std::vector<HeapAbstraction::RegionVec> equivClasses;
+
   // reachable from inputs and outputs
   seadsa_heap_abs_impl::NodeSet reach, retReach;
   seadsa_heap_abs_impl::argReachableNodes(f, G, reach, retReach);
   // and also reachable from locals
-  for(auto &kv: G.scalars()) {
+  for (auto &kv : G.scalars()) {
     if (const Node *n = kv.second->getNode()) {
       markReachableNodes(n, reach);
-    }    
+    }
   }
-  
+
   for (const Node *n : reach) {
     bool isRetReach = retReach.count(n) > 0;
     if (!isRetReach && !n->isRead() && !n->isModified()) {
       continue;
     }
-    RegionVec nodeRgns;    
+    HeapAbstraction::RegionVec nodeRgns;
     std::vector<unsigned> fields = extractFields(n);
     for (auto field : fields) {
       Cell c(const_cast<Node *>(n), field);
       RegionInfo r_info =
-	SeaDsaToRegion(c, m_dl, m_disambiguate_unknown,
-		       m_disambiguate_ptr_cast, m_disambiguate_external);
+          SeaDsaToRegion(c, m_dl,
+			 m_params.disambiguate_unknown,
+                         m_params.disambiguate_ptr_cast,
+			 m_params.disambiguate_external);
       nodeRgns.emplace_back(mkRegion(c, r_info));
-    } 
+    }
     equivClasses.emplace_back(std::move(nodeRgns));
   }
-  
-  m_func_equiv_class_regions[&f] = std::move(equivClasses);  
+
+  m_func_equiv_class_regions[&f] = std::move(equivClasses);
 }
-  
+
 // Compute and cache the set of read, mod and new nodes of a
 // callsite such that mod nodes are a subset of the read nodes and
 // the new nodes are disjoint from mod nodes.
-void SeaDsaHeapAbstraction::computeReadModNewNodesFromCallSite(
+void SeaDsaHeapAbstractionImpl::computeReadModNewNodesFromCallSite(
     const llvm::CallInst &I, callsite_map_t &accessed_map,
     callsite_map_t &mods_map, callsite_map_t &news_map) {
-  if (!m_dsa)
+
+  auto checkConsistency = [this](const RegionInfo &r1, const RegionInfo &r2) {
+    bool res = r1.hasCompatibleType(r2);
+    if (m_params.precision_level == CrabBuilderPrecision::SINGLETON_MEM) {
+      // seadsa does not guarantee that callsites agree with their
+      // corresponding function parameters on dsa node flags.
+      res &= (r1.isHeap() == r2.isHeap()); 
+    }
+    return res;
+  };
+  
+  if (!m_dsa) {
     return;
+  }
 
   /// ignore inline assembly
-  if (I.isInlineAsm())
+  if (I.isInlineAsm()) {
     return;
-
+  }
+  
   DsaCallSite CS(I);
 
   if (!CS.getCallee()) {
@@ -260,7 +391,7 @@ void SeaDsaHeapAbstraction::computeReadModNewNodesFromCallSite(
   SimulationMapper simMap;
   Graph::computeCalleeCallerMapping(CS, calleeG, callerG, simMap);
 
-  std::vector<region_bool_t> reads, mods, news;
+  std::vector<std::pair<Region, bool>> reads, mods, news;
   for (const Node *n : reach) {
     bool isRetReach = retReach.count(n) > 0;
 
@@ -279,30 +410,26 @@ void SeaDsaHeapAbstraction::computeReadModNewNodesFromCallSite(
         CLAM_ERROR("caller cell cannot be mapped to callee cell");
       }
       RegionInfo callerRI =
-          SeaDsaToRegion(callerC, m_dl, m_disambiguate_unknown,
-                         m_disambiguate_ptr_cast, m_disambiguate_external);
-      Region rgn(mkRegion(callerC, callerRI));
-
-      //  == begin sanity check ==
+          SeaDsaToRegion(callerC, m_dl,
+			 m_params.disambiguate_unknown,
+                         m_params.disambiguate_ptr_cast,
+			 m_params.disambiguate_external);
       RegionInfo calleeRI =
-          SeaDsaToRegion(calleeC, m_dl, m_disambiguate_unknown,
-                         m_disambiguate_ptr_cast, m_disambiguate_external);
-      if (!calleeRI.hasCompatibleType(callerRI)) {
-        CLAM_WARNING("Caller region info="
-                     << callerRI
-                     << " different from callee region info=" << calleeRI);
-      }
-      bool is_compat_callsite = calleeRI.hasCompatibleType(callerRI);
-      //  == end sanity check ==
-
+          SeaDsaToRegion(calleeC, m_dl,
+			 m_params.disambiguate_unknown,
+                         m_params.disambiguate_ptr_cast,
+			 m_params.disambiguate_external);
+      bool isConsistent = checkConsistency(callerRI, calleeRI);
+      
+      Region rgn(mkRegion(callerC, callerRI));      
       if (!isRetReach) {
-        reads.push_back({rgn, is_compat_callsite});
+        reads.push_back({rgn, isConsistent});
         if (n->isModified()) {
-          mods.push_back({rgn, is_compat_callsite});
+          mods.push_back({rgn, isConsistent});
         }
       } else {
         // if (n->isModified()) {
-        news.push_back({rgn, is_compat_callsite});
+        news.push_back({rgn, isConsistent});
         //}
       }
     }
@@ -336,9 +463,9 @@ void SeaDsaHeapAbstraction::computeReadModNewNodesFromCallSite(
       } llvm::errs()
       << "}\n";);
 }
-
+  
 // Pre-compute all the information per function and callsites
-void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
+void SeaDsaHeapAbstractionImpl::initialize(const llvm::Module &M) {
 
   CRAB_LOG(
       "heap-abs",
@@ -359,14 +486,13 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
   // For the sanity check implemented below
   DenseMap<const Function *, std::vector<DsaCallSite>> FunctionCallsMap;
 
-  std::vector<const Function*> functions;
+  std::vector<const Function *> functions;
   for (auto const &F : M) {
     functions.push_back(&F);
   }
   std::sort(functions.begin(), functions.end());
-  
-  //for (auto const &F : M) {
-  for (const Function *FF: functions) {
+
+  for (const Function *FF : functions) {
     auto &F = *FF;
     computeReadModNewNodes(F);
     computeEquivClasses(F);
@@ -391,9 +517,9 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
   /// that whether two region's types are compatible is defined by
   /// "hasCompatibleType".
   for (auto const &F : M) {
-    RegionVec &readsF = m_func_accessed[&F];
-    RegionVec &modsF = m_func_mods[&F];
-    RegionVec &newsF = m_func_news[&F];
+    HeapAbstraction::RegionVec &readsF = m_func_accessed[&F];
+    HeapAbstraction::RegionVec &modsF = m_func_mods[&F];
+    HeapAbstraction::RegionVec &newsF = m_func_news[&F];
 
     // Initialized to true (i.e., all regions are consistent until the
     // opposite is proven)
@@ -408,12 +534,12 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
       const CallInst *CI = cast<CallInst>(CS.getInstruction());
       FCalls.push_back(CI);
 
-      std::vector<region_bool_t> &readsC = CSAccessed[CI];
-      std::vector<region_bool_t> &modsC = CSMods[CI];
-      std::vector<region_bool_t> &newsC = CSNews[CI];
+      std::vector<std::pair<Region, bool>> &readsC = CSAccessed[CI];
+      std::vector<std::pair<Region, bool>> &modsC = CSMods[CI];
+      std::vector<std::pair<Region, bool>> &newsC = CSNews[CI];
 
       // Check that at the beginning caller and callee agree on the
-      // number of memory regions, othewrwise there is nothing we can do.
+      // number of memory regions, otherwwise there is nothing we can do.
       if (readsC.size() != readsF.size()) {
         CLAM_ERROR("Different num of read and modified regions between "
                    "callsite and its callee "
@@ -431,35 +557,43 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
       }
 
       // Keep track of inconsistent memory regions (i.e., regions on
-      // which caller and callee disagree)
+      // which caller and callee disagree). Note that there are
+      // legitimate cases where they can disagree.
       for (unsigned i = 0, e = readsC.size(); i < e; i++) {
         readsB[i] = readsB[i] && readsC[i].second;
-	if (!readsC[i].second) {
-	  CLAM_WARNING("Caller and callee disagree on some read region type\n"
-		       << "Callsite=" << *CI << "\n"
-		       << "Caller=" << *CS.getCaller() << "\n");
-	}
+	CRAB_LOG("heap-abs-regions",
+		  if (!readsC[i].second) {
+		    llvm::errs() << "Caller and callee disagree on some read region type\n"
+		                 << "\tCallsite=" << *CI << "\n"
+		                 << "\tRegion at caller=" << readsF[i] << "\n"
+		                 << "\tRegion at callee=" << readsC[i].first << "\n";
+		  });
+		  
       }
       for (unsigned i = 0, e = modsC.size(); i < e; i++) {
         modsB[i] = modsB[i] && modsC[i].second;
-	if (!modsC[i].second) {
-	  CLAM_WARNING("Caller and callee disagree on some modified region type\n"
-		       << "Callsite=" << *CI << "\n"
-		       << "Caller=" << *CS.getCaller() << "\n");
-	}	
+	CRAB_LOG("heap-abs-regions",
+		  if (!modsC[i].second) {
+		    llvm::errs() << "Caller and callee disagree on some modified region type\n"
+		                 << "\tCallsite=" << *CI << "\n"
+		                 << "\tRegion at caller=" << modsF[i] << "\n"
+		                 << "\tRegion at callee=" << modsC[i].first << "\n";
+		  });
       }
       for (unsigned i = 0, e = newsC.size(); i < e; i++) {
         newsB[i] = newsB[i] && newsC[i].second;
-	if (!newsC[i].second) {
-	  CLAM_WARNING("Caller and callee disagree on some new region type\n"
-		       << "Callsite=" << *CI << "\n"
-		       << "Caller=" << *CS.getCaller() << "\n");
-	}
+	CRAB_LOG("heap-abs-regions",
+		  if (!newsC[i].second) {
+		    llvm::errs() << "Caller and callee disagree on some new region type\n"
+		                 << "\tCallsite=" << *CI << "\n"
+		                 << "\tRegion at caller=" << newsF[i] << "\n"
+		                 << "\tRegion at callee=" << newsC[i].first << "\n";
+		  });
       }
     }
 
     /// Second phase: cache final regions.
-    RegionVec readsF_out, modsF_out, newsF_out;
+    HeapAbstraction::RegionVec readsF_out, modsF_out, newsF_out;
     for (unsigned i = 0, e = readsB.size(); i < e; i++) {
       if (readsB[i]) {
         readsF_out.push_back(readsF[i]);
@@ -483,10 +617,10 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
     while (!FCalls.empty()) {
       const CallInst *CI = FCalls.back();
       FCalls.pop_back();
-      RegionVec readsC_out, modsC_out, newsC_out;
-      std::vector<region_bool_t> &readsC = CSAccessed[CI];
-      std::vector<region_bool_t> &modsC = CSMods[CI];
-      std::vector<region_bool_t> &newsC = CSNews[CI];
+      HeapAbstraction::RegionVec readsC_out, modsC_out, newsC_out;
+      std::vector<std::pair<Region, bool>> &readsC = CSAccessed[CI];
+      std::vector<std::pair<Region, bool>> &modsC = CSMods[CI];
+      std::vector<std::pair<Region, bool>> &newsC = CSNews[CI];
       for (unsigned i = 0, e = readsB.size(); i < e; i++) {
         if (readsB[i]) {
           readsC_out.push_back(readsC[i].first);
@@ -530,20 +664,17 @@ void SeaDsaHeapAbstraction::initialize(const llvm::Module &M) {
   }
 }
 
-SeaDsaHeapAbstraction::SeaDsaHeapAbstraction(
+SeaDsaHeapAbstractionImpl::SeaDsaHeapAbstractionImpl(
     const llvm::Module &M, llvm::CallGraph &cg,
     const llvm::TargetLibraryInfoWrapperPass &tli,
     const seadsa::AllocWrapInfo &alloc_info,
-    const seadsa::DsaLibFuncInfo &spec_graph_info, bool is_context_sensitive,
-    bool disambiguate_unknown, bool disambiguate_ptr_cast,
-    bool disambiguate_external)
-  : m_dsa(nullptr), m_fac(new SetFactory()), m_dl(M.getDataLayout()), m_max_id(0),
-    m_disambiguate_unknown(disambiguate_unknown),
-    m_disambiguate_ptr_cast(disambiguate_ptr_cast),
-    m_disambiguate_external(disambiguate_external) {
+    const seadsa::DsaLibFuncInfo &spec_graph_info,
+    SeaDsaHeapAbstractionParams params)
+    : m_dsa(nullptr), m_fac(new SetFactory()), m_dl(M.getDataLayout()),
+      m_max_id(0), m_params(params) {
 
   // -- Run sea-dsa
-  if (!is_context_sensitive) {
+  if (!m_params.is_context_sensitive) {
     m_dsa = new seadsa::ContextInsensitiveGlobalAnalysis(
         m_dl, *(const_cast<llvm::TargetLibraryInfoWrapperPass *>(&tli)),
         alloc_info, spec_graph_info, cg, *m_fac, false);
@@ -553,24 +684,19 @@ SeaDsaHeapAbstraction::SeaDsaHeapAbstraction(
         alloc_info, spec_graph_info, cg, *m_fac);
   }
   m_dsa->runOnModule(const_cast<Module &>(M));
-  
+
   initialize(M);
 }
 
-SeaDsaHeapAbstraction::SeaDsaHeapAbstraction(const llvm::Module &M,
-                                             seadsa::GlobalAnalysis &dsa,
-                                             bool disambiguate_unknown,
-                                             bool disambiguate_ptr_cast,
-                                             bool disambiguate_external)
+SeaDsaHeapAbstractionImpl::SeaDsaHeapAbstractionImpl(
+    const llvm::Module &M, seadsa::GlobalAnalysis &dsa,
+    SeaDsaHeapAbstractionParams params)
     : m_dsa(&dsa), m_fac(nullptr), m_dl(M.getDataLayout()), m_max_id(0),
-      m_disambiguate_unknown(disambiguate_unknown),
-      m_disambiguate_ptr_cast(disambiguate_ptr_cast),
-      m_disambiguate_external(disambiguate_external) {
-
+      m_params(params) {
   initialize(M);
 }
 
-SeaDsaHeapAbstraction::~SeaDsaHeapAbstraction() {
+SeaDsaHeapAbstractionImpl::~SeaDsaHeapAbstractionImpl() {
   if (m_fac) {
     // if m_fac is not null we know that we own m_dsa
     delete m_dsa;
@@ -578,8 +704,8 @@ SeaDsaHeapAbstraction::~SeaDsaHeapAbstraction() {
 }
 
 // f is used to know in which Graph we should search for V
-Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &fn,
-                                        const llvm::Value &V) {
+Region SeaDsaHeapAbstractionImpl::getRegion(const llvm::Function &fn,
+                                            const llvm::Value &V) {
   if (!m_dsa || !m_dsa->hasGraph(fn)) {
     return Region();
   }
@@ -594,15 +720,17 @@ Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &fn,
     return Region();
   }
 
-  RegionInfo r_info =
-      SeaDsaToRegion(c, m_dl, m_disambiguate_unknown, m_disambiguate_ptr_cast,
-                     m_disambiguate_external);
+  RegionInfo r_info = SeaDsaToRegion(c, m_dl,
+				     m_params.disambiguate_unknown,
+				     m_params.disambiguate_ptr_cast,
+				     m_params.disambiguate_external);
   return mkRegion(c, r_info);
 }
 
-Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &fn,
-                                        const llvm::Value &V, unsigned offset,
-                                        const Type &AccessedType) {
+Region SeaDsaHeapAbstractionImpl::getRegion(const llvm::Function &fn,
+                                            const llvm::Value &V,
+                                            unsigned offset,
+                                            const Type &AccessedType) {
 
   if (!m_dsa || !m_dsa->hasGraph(fn)) {
     return Region();
@@ -617,15 +745,18 @@ Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &fn,
     if (n->hasAccessedType(offset)) {
       Cell c(n, offset);
       RegionInfo r_info =
-          SeaDsaToRegion(c, m_dl, m_disambiguate_unknown,
-                         m_disambiguate_ptr_cast, m_disambiguate_external);
+          SeaDsaToRegion(c, m_dl,
+			 m_params.disambiguate_unknown,
+                         m_params.disambiguate_ptr_cast,
+			 m_params.disambiguate_external);
       return mkRegion(c, r_info);
     }
   }
   return Region();
 }
 
-const llvm::Value *SeaDsaHeapAbstraction::getSingleton(RegionId region) const {
+const llvm::Value *SeaDsaHeapAbstractionImpl::getSingleton(
+    HeapAbstraction::RegionId region) const {
   auto const it = m_rev_node_ids.find(region);
   if (it == m_rev_node_ids.end())
     return nullptr;
@@ -648,13 +779,13 @@ const llvm::Value *SeaDsaHeapAbstraction::getSingleton(RegionId region) const {
 //
 // e.g., [1,3,3,4] \ [1,3] = [3,4]
 // e.g., [1,3,3,3,4,5] \ [1,3,3] = [3,4,5]
-static SeaDsaHeapAbstraction::RegionVec
-stable_difference(SeaDsaHeapAbstraction::RegionVec &v1,
-                  SeaDsaHeapAbstraction::RegionVec &v2) {
+static HeapAbstraction::RegionVec
+stable_difference(HeapAbstraction::RegionVec &v1,
+                  HeapAbstraction::RegionVec &v2) {
   // v1 and v2 can be modified because we pass copies
 
   std::sort(v2.begin(), v2.end());
-  SeaDsaHeapAbstraction::RegionVec out;
+  HeapAbstraction::RegionVec out;
   out.reserve(v1.size());
   for (auto rgn : v1) {
     auto lower = std::lower_bound(v2.begin(), v2.end(), rgn);
@@ -672,58 +803,130 @@ stable_difference(SeaDsaHeapAbstraction::RegionVec &v1,
   return out;
 }
 
-template<class Map, class MapKey>
-static SeaDsaHeapAbstraction::RegionVec lookup(const Map &m, const MapKey func) {
+template <class Map, class MapKey>
+static HeapAbstraction::RegionVec lookup(const Map &m, const MapKey func) {
   auto it = m.find(func);
   if (it != m.end()) {
     return it->second;
   } else {
-    return SeaDsaHeapAbstraction::RegionVec();
+    return HeapAbstraction::RegionVec();
   }
 }
-  
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getOnlyReadRegions(const llvm::Function &fn) const {
-  RegionVec v1 = lookup(m_func_accessed, &fn);
-  RegionVec v2 = lookup(m_func_mods,&fn);
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getOnlyReadRegions(const llvm::Function &fn) const {
+  HeapAbstraction::RegionVec v1 = lookup(m_func_accessed, &fn);
+  HeapAbstraction::RegionVec v2 = lookup(m_func_mods, &fn);
   return stable_difference(v1, v2);
 }
 
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getModifiedRegions(const llvm::Function &fn) const {
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getModifiedRegions(const llvm::Function &fn) const {
   return lookup(m_func_mods, &fn);
 }
 
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getNewRegions(const llvm::Function &fn) const {
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getNewRegions(const llvm::Function &fn) const {
   return lookup(m_func_news, &fn);
 }
 
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getOnlyReadRegions(const llvm::CallInst &I) const {
-  RegionVec v1 = lookup(m_callsite_accessed, &I);
-  RegionVec v2 = lookup(m_callsite_mods, &I);
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getOnlyReadRegions(const llvm::CallInst &I) const {
+  HeapAbstraction::RegionVec v1 = lookup(m_callsite_accessed, &I);
+  HeapAbstraction::RegionVec v2 = lookup(m_callsite_mods, &I);
   return stable_difference(v1, v2);
 }
 
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getModifiedRegions(const llvm::CallInst &I) const {
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getModifiedRegions(const llvm::CallInst &I) const {
   return lookup(m_callsite_mods, &I);
 }
 
-SeaDsaHeapAbstraction::RegionVec
-SeaDsaHeapAbstraction::getNewRegions(const llvm::CallInst &I) const {
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstractionImpl::getNewRegions(const llvm::CallInst &I) const {
   return lookup(m_callsite_news, &I);
 }
 
-std::vector<SeaDsaHeapAbstraction::RegionVec>
-SeaDsaHeapAbstraction::getEquivClassRegions(const llvm::Function &fn) const {
+std::vector<HeapAbstraction::RegionVec>
+SeaDsaHeapAbstractionImpl::getEquivClassRegions(
+    const llvm::Function &fn) const {
   auto it = m_func_equiv_class_regions.find(&fn);
   if (it != m_func_equiv_class_regions.end()) {
-    return it->second;    
+    return it->second;
   } else {
-    return std::vector<SeaDsaHeapAbstraction::RegionVec>();
+    return std::vector<HeapAbstraction::RegionVec>();
   }
 }
-  
+
+SeaDsaHeapAbstraction::SeaDsaHeapAbstraction(
+    const llvm::Module &M, llvm::CallGraph &cg,
+    const llvm::TargetLibraryInfoWrapperPass &tli,
+    const seadsa::AllocWrapInfo &awi, const seadsa::DsaLibFuncInfo &sgi,
+    SeaDsaHeapAbstractionParams params) {
+  m_impl = std::make_unique<SeaDsaHeapAbstractionImpl>(
+      M, cg, tli, awi, sgi, params);
+}
+
+SeaDsaHeapAbstraction::SeaDsaHeapAbstraction(const llvm::Module &M,
+                                             seadsa::GlobalAnalysis &dsa,
+					     SeaDsaHeapAbstractionParams params) {
+  m_impl = std::make_unique<SeaDsaHeapAbstractionImpl>(M, dsa, params);
+}
+
+SeaDsaHeapAbstraction::~SeaDsaHeapAbstraction() {}
+
+seadsa::GlobalAnalysis *SeaDsaHeapAbstraction::getSeaDsa() {
+  return m_impl->getSeaDsa();
+}
+
+const seadsa::GlobalAnalysis *SeaDsaHeapAbstraction::getSeaDsa() const {
+  return m_impl->getSeaDsa();
+}
+
+Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &F,
+                                        const llvm::Value &V) {
+  return m_impl->getRegion(F, V);
+}
+
+Region SeaDsaHeapAbstraction::getRegion(const llvm::Function &F,
+                                        const llvm::Value &V, unsigned offset,
+                                        const llvm::Type &accessedType) {
+  return m_impl->getRegion(F, V, offset, accessedType);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getOnlyReadRegions(const llvm::Function &F) const {
+  return m_impl->getOnlyReadRegions(F);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getModifiedRegions(const llvm::Function &F) const {
+  return m_impl->getModifiedRegions(F);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getNewRegions(const llvm::Function &F) const {
+  return m_impl->getNewRegions(F);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getOnlyReadRegions(const llvm::CallInst &I) const {
+  return m_impl->getOnlyReadRegions(I);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getModifiedRegions(const llvm::CallInst &I) const {
+  return m_impl->getModifiedRegions(I);
+}
+
+HeapAbstraction::RegionVec
+SeaDsaHeapAbstraction::getNewRegions(const llvm::CallInst &I) const {
+  return m_impl->getNewRegions(I);
+}
+
+std::vector<HeapAbstraction::RegionVec>
+SeaDsaHeapAbstraction::getEquivClassRegions(const llvm::Function &F) const {
+  return m_impl->getEquivClassRegions(F);
+}
+
 } // namespace clam
